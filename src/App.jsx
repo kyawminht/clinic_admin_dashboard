@@ -1,4 +1,7 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useOnlineStatus } from "./hooks/useOnlineStatus";
+import { enqueueMutation, loadQueue, removeMutation } from "./services/offlineMutationQueue";
 
 // ─────────────────────────────────────────────
 // i18n strings  (English / Burmese)
@@ -23,10 +26,12 @@ const STRINGS = {
     markCompleted: "Mark Completed",
     serving: "Serving",
     waiting: "Waiting",
+    not_started: "Not started",
     completed: "Completed",
     addWalkin: "Add Walk-in",
     patientName: "Patient Name",
     phoneNumber: "Phone Number",
+    chooseDoctor: "Choose Doctor",
     addToQueue: "+ Add to Queue",
     doctor: "Doctor",
     status: "Status",
@@ -58,10 +63,12 @@ const STRINGS = {
     markCompleted: "ပြီးစီး",
     serving: "ဆောင်ရွက်နေ",
     waiting: "စောင့်နေ",
+    not_started: "မစတင်သေးပါ",
     completed: "ပြီးစီး",
     addWalkin: "လမ်းလျောက်လာသူ ထည့်မည်",
     patientName: "လူနာအမည်",
     phoneNumber: "ဖုန်းနံပါတ်",
+    chooseDoctor: "ဆရာဝန် ရွေးချယ်မည်",
     addToQueue: "+ တန်းထဲ ထည့်မည်",
     doctor: "ဆရာဝန်",
     status: "အခြေအနေ",
@@ -91,16 +98,44 @@ const generateMockQueue = () =>
     { id: 6, name: "Daw Khin Khin", phone: "09 666 777 888", doctor: DOCTORS[1], status: "waiting" },
   ];
 
-const fakeApi = {
-  login: (username, password) =>
-    new Promise((res, rej) =>
-      setTimeout(() => {
-        if (username === "admin" && password === "admin123") res({ token: "mock-token-xyz" });
-        else rej(new Error("Invalid credentials"));
-      }, 1200)
-    ),
-  fetchQueue: () =>
-    new Promise((res) => setTimeout(() => res(generateMockQueue()), 900)),
+const API_BASE_URL = import.meta.env.VITE_API_URL || "";
+
+async function apiRequest(path, { token, method = "GET", body, headers } = {}) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(headers || {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+
+  if (!response.ok) {
+    const message = data?.message || response.statusText || "Request failed";
+    throw new Error(message);
+  }
+
+  return data;
+}
+
+const api = {
+  adminLogin: (username, password) =>
+    apiRequest("/api/admin/login", { method: "POST", body: { username, password } }),
+  adminLogout: (token) => apiRequest("/api/admin/logout", { token, method: "POST" }),
+  fetchBookings: (token, dateKey) => apiRequest(`/api/bookings?date=${encodeURIComponent(dateKey)}`, { token }),
+  startQueue: (token, dateKey) =>
+    apiRequest(`/api/queue/start?date=${encodeURIComponent(dateKey)}`, { token, method: "POST" }),
+  fetchQueueStatus: (dateKey) => apiRequest(`/api/queue/status?date=${encodeURIComponent(dateKey)}`),
+  moveToNext: (token, dateKey) =>
+    apiRequest(`/api/bookings/next?date=${encodeURIComponent(dateKey)}`, { token, method: "POST" }),
+  updateBookingStatus: (token, id, status) =>
+    apiRequest(`/api/bookings/${id}/status`, { token, method: "PATCH", body: { status } }),
+  createBooking: (token, payload) =>
+    apiRequest("/api/bookings", { token, method: "POST", body: payload }),
 };
 
 // ─────────────────────────────────────────────
@@ -109,7 +144,7 @@ const fakeApi = {
 
 /** useAuth — login / logout simulation */
 function useAuth() {
-  const [token, setToken] = useState(null);
+  const [token, setToken] = useState(() => localStorage.getItem("admin_token"));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
@@ -117,7 +152,8 @@ function useAuth() {
     setLoading(true);
     setError(null);
     try {
-      const { token } = await fakeApi.login(username, password);
+      const { token } = await api.adminLogin(username, password);
+      localStorage.setItem("admin_token", token);
       setToken(token);
     } catch (e) {
       setError(e.message);
@@ -126,77 +162,181 @@ function useAuth() {
     }
   }, []);
 
-  const logout = useCallback(() => setToken(null), []);
+  const logout = useCallback(async () => {
+    const existingToken = token;
+    setToken(null);
+    localStorage.removeItem("admin_token");
+
+    if (!existingToken) return;
+    try {
+      await api.adminLogout(existingToken);
+    } catch {
+      // ignore (server may be down)
+    }
+  }, [token]);
 
   return { token, isAuthenticated: !!token, loading, error, login, logout };
 }
 
+function normalizeBookingStatus(status) {
+  if (status === "done") return "completed";
+  if (status === "not_started") return "not_started";
+  return status;
+}
+
+function mapBookingToPatient(booking) {
+  return {
+    id: booking.id,
+    queueNumber: booking.queueNumber,
+    name: booking.patientName,
+    phone: booking.phone,
+    doctor: booking.doctorName,
+    status: normalizeBookingStatus(booking.status),
+  };
+}
+
 /** useQueueData — TanStack-Query-style with staleTime, cache & mutations */
-function useQueueData() {
-  const cacheRef = useRef({ data: null, fetchedAt: null });
-  const STALE_MS = 5 * 60 * 1000; // 5 minutes
+function getLocalDateKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
 
-  const [queue, setQueue] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isFetching, setIsFetching] = useState(false);
+function useQueueData(token, dateKey, onUnauthorized) {
+  const queryClient = useQueryClient();
+  const isOnline = useOnlineStatus();
 
-  const fetchQueue = useCallback(async (force = false) => {
-    const cache = cacheRef.current;
-    const isStale = !cache.fetchedAt || Date.now() - cache.fetchedAt > STALE_MS;
-    if (!force && !isStale && cache.data) {
-      setQueue(cache.data);
-      setIsLoading(false);
-      return;
+  const queryKey = ["adminQueue", token, dateKey];
+  const {
+    data: snapshot,
+    isLoading,
+    isFetching,
+    error,
+    refetch,
+  } = useQuery({
+    queryKey,
+    enabled: Boolean(token && dateKey),
+    queryFn: () => api.fetchBookings(token, dateKey),
+  });
+
+  useEffect(() => {
+    if (error?.message === "Unauthorized") onUnauthorized?.();
+  }, [error, onUnauthorized]);
+
+  const queue = (snapshot?.appointments || []).map(mapBookingToPatient);
+  const queueStatus = { started: Boolean(snapshot?.started), startedAt: snapshot?.startedAt || null };
+
+  const flushOfflineQueue = useCallback(async () => {
+    if (!isOnline || !token) return;
+    const items = loadQueue();
+    if (!items.length) return;
+
+    for (const item of items) {
+      try {
+        if (item.type === "startQueue") {
+          await api.startQueue(token, item.dateKey);
+        } else if (item.type === "callNext") {
+          await api.moveToNext(token, item.dateKey);
+        } else if (item.type === "markCompleted") {
+          await api.updateBookingStatus(token, item.bookingId, "done");
+        } else if (item.type === "addWalkin") {
+          await api.createBooking(token, item.payload);
+        }
+        removeMutation(item.queueId);
+      } catch (e) {
+        if (e?.message === "Unauthorized") onUnauthorized?.();
+        break;
+      }
     }
-    setIsFetching(true);
-    const data = await fakeApi.fetchQueue();
-    cacheRef.current = { data, fetchedAt: Date.now() };
-    setQueue(data);
-    setIsLoading(false);
-    setIsFetching(false);
-  }, []);
 
-  useEffect(() => { fetchQueue(); }, [fetchQueue]);
+    await queryClient.invalidateQueries({ queryKey });
+  }, [isOnline, token, queryClient, queryKey, onUnauthorized]);
 
-  /** Mutation: call the next waiting patient */
-  const callNext = useCallback(() => {
-    setQueue((prev) => {
-      const idx = prev.findIndex((p) => p.status === "waiting");
-      if (idx === -1) return prev;
-      const updated = prev.map((p, i) =>
-        i === idx ? { ...p, status: "serving" } : p.status === "serving" ? { ...p, status: "waiting" } : p
-      );
-      cacheRef.current.data = updated;
-      return updated;
-    });
-  }, []);
+  useEffect(() => {
+    flushOfflineQueue().catch(() => null);
+  }, [flushOfflineQueue]);
 
-  /** Mutation: mark a patient completed */
-  const markCompleted = useCallback((id) => {
-    setQueue((prev) => {
-      const updated = prev.filter((p) => p.id !== id);
-      cacheRef.current.data = updated;
-      return updated;
-    });
-  }, []);
+  const startDayMutation = useMutation({
+    mutationFn: async () => {
+      if (!isOnline) {
+        enqueueMutation({ type: "startQueue", dateKey });
+        return { queued: true };
+      }
+      return api.startQueue(token, dateKey);
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey }),
+  });
 
-  /** Mutation: add walk-in patient */
-  const addWalkin = useCallback((name, phone) => {
-    setQueue((prev) => {
-      const newPatient = {
-        id: Date.now(),
-        name,
-        phone,
-        doctor: DOCTORS[Math.floor(Math.random() * DOCTORS.length)],
-        status: "waiting",
+  const callNextMutation = useMutation({
+    mutationFn: async () => {
+      if (!isOnline) {
+        enqueueMutation({ type: "callNext", dateKey });
+        return { queued: true };
+      }
+      return api.moveToNext(token, dateKey);
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey }),
+  });
+
+  const markCompletedMutation = useMutation({
+    mutationFn: async (id) => {
+      if (!isOnline) {
+        enqueueMutation({ type: "markCompleted", bookingId: id });
+        queryClient.setQueryData(queryKey, (previous) => {
+          const prev = previous || {};
+          const appointments = Array.isArray(prev.appointments) ? prev.appointments : [];
+          return {
+            ...prev,
+            appointments: appointments.map((apt) => (String(apt.id) === String(id) ? { ...apt, status: "done" } : apt)),
+          };
+        });
+        return { queued: true };
+      }
+      return api.updateBookingStatus(token, id, "done");
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey }),
+  });
+
+  const addWalkinMutation = useMutation({
+    mutationFn: async ({ name, phone, doctorName }) => {
+      if (dateKey !== getLocalDateKey()) {
+        throw new Error("Walk-in can only be added for today");
+      }
+
+      const chosenDoctorName = doctorName || DOCTORS[0];
+      const payload = {
+        user: { name, age: 18, phone },
+        doctor: {
+          id: chosenDoctorName.toLowerCase().replace(/\\s+/g, "-"),
+          name: chosenDoctorName,
+        },
+        slot: new Date().toISOString(),
+        date: dateKey,
       };
-      const updated = [...prev, newPatient];
-      cacheRef.current.data = updated;
-      return updated;
-    });
-  }, []);
 
-  return { queue, isLoading, isFetching, callNext, markCompleted, addWalkin, refetch: () => fetchQueue(true) };
+      if (!isOnline) {
+        enqueueMutation({ type: "addWalkin", payload });
+        return { queued: true };
+      }
+
+      return api.createBooking(token, payload);
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey }),
+  });
+
+  return {
+    queue,
+    isLoading,
+    isFetching,
+    error: error?.message || null,
+    queueStatus,
+    startDay: () => startDayMutation.mutateAsync(),
+    callNext: () => callNextMutation.mutateAsync(),
+    markCompleted: (id) => markCompletedMutation.mutateAsync(id),
+    addWalkin: (name, phone, doctorName) => addWalkinMutation.mutateAsync({ name, phone, doctorName }),
+    refetch: () => refetch(),
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -220,6 +360,7 @@ function StatusBadge({ status, t }) {
   const map = {
     serving: "bg-sky-600 text-white",
     waiting: "bg-gray-200 text-gray-600",
+    not_started: "bg-amber-100 text-amber-700",
     completed: "bg-green-100 text-green-700",
   };
   return (
@@ -230,6 +371,7 @@ function StatusBadge({ status, t }) {
 }
 
 function PatientRow({ patient, onMarkCompleted, t, index }) {
+  const isCompleted = patient.status === "completed";
   return (
     <div className="flex items-center gap-3 px-4 py-3 border-b border-sky-50 hover:bg-sky-50 transition-colors">
       <span className="text-sm font-semibold text-gray-400 w-5 shrink-0">{index}</span>
@@ -241,7 +383,8 @@ function PatientRow({ patient, onMarkCompleted, t, index }) {
       <StatusBadge status={patient.status} t={t} />
       <button
         onClick={() => onMarkCompleted(patient.id)}
-        className="shrink-0 text-xs font-bold text-sky-600 border-2 border-sky-500 rounded-lg px-3 py-1.5 hover:bg-sky-600 hover:text-white transition-all whitespace-nowrap"
+        disabled={isCompleted}
+        className="shrink-0 text-xs font-bold text-sky-600 border-2 border-sky-500 rounded-lg px-3 py-1.5 hover:bg-sky-600 hover:text-white disabled:opacity-60 disabled:hover:bg-transparent disabled:hover:text-sky-600 transition-all whitespace-nowrap"
       >
         {t.markCompleted}
       </button>
@@ -282,13 +425,13 @@ function QueueTable({ queue, isLoading, onMarkCompleted, t }) {
 function WalkinForm({ onAdd, t }) {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
+  const [doctor, setDoctor] = useState(DOCTORS[0]);
   const [busy, setBusy] = useState(false);
 
   const handleAdd = async () => {
     if (!name.trim() || !phone.trim()) return;
     setBusy(true);
-    await new Promise((r) => setTimeout(r, 600)); // simulate async
-    onAdd(name.trim(), phone.trim());
+    await onAdd(name.trim(), phone.trim(), doctor);
     setName("");
     setPhone("");
     setBusy(false);
@@ -317,6 +460,20 @@ function WalkinForm({ onAdd, t }) {
             placeholder={t.phoneNumber}
             className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400 transition"
           />
+        </div>
+        <div>
+          <label className="block text-base text-gray-600 mb-1">{t.chooseDoctor}</label>
+          <select
+            value={doctor}
+            onChange={(e) => setDoctor(e.target.value)}
+            className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-400 transition"
+          >
+            {DOCTORS.map((d) => (
+              <option key={d} value={d}>
+                {d}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="flex justify-end">
           <button
@@ -438,8 +595,10 @@ function LoginScreen({ onLogin, loading, error, lang, setLang, t }) {
 // Dashboard Screen — Container
 // ─────────────────────────────────────────────
 
-function DashboardContainer({ onLogout, lang, setLang, t }) {
-  const { queue, isLoading, isFetching, callNext, markCompleted, addWalkin } = useQueueData();
+function DashboardContainer({ token, onLogout, lang, setLang, t }) {
+  const [selectedDate, setSelectedDate] = useState(getLocalDateKey());
+  const { queue, isLoading, isFetching, error, queueStatus, startDay, callNext, markCompleted, addWalkin } =
+    useQueueData(token, selectedDate, onLogout);
   const [activeNav, setActiveNav] = useState("queue");
 
   return (
@@ -486,6 +645,12 @@ function DashboardContainer({ onLogout, lang, setLang, t }) {
             <p className="text-base text-gray-600 mt-1">{t.subtitle}</p>
           </div>
 
+          {error && (
+            <div className="bg-red-50 border border-red-200 text-red-700 rounded-2xl px-6 py-3 text-sm">
+              {error}
+            </div>
+          )}
+
           {/* Queue header + Call Next */}
           <div className="bg-white rounded-2xl shadow-sm px-6 py-4 flex flex-wrap items-center justify-between gap-4">
             <div>
@@ -496,14 +661,34 @@ function DashboardContainer({ onLogout, lang, setLang, t }) {
                 </span>
               )}
               {isFetching && <span className="ml-3 text-xs text-sky-400 animate-pulse">↻</span>}
+              <div className="mt-2">
+                <input
+                  type="date"
+                  value={selectedDate}
+                  onChange={(e) => setSelectedDate(e.target.value)}
+                  className="border border-sky-100 rounded-xl px-3 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-sky-400"
+                />
+              </div>
             </div>
-            <button
-              onClick={callNext}
-              className="bg-sky-600 text-white font-bold text-sm px-5 py-2.5 rounded-xl hover:bg-sky-700 transition-all shadow-md"
-            >
-              {/* Burmese: + နောက်လူနာ ခေါ်မည် */}
-              {t.callNext}
-            </button>
+            <div className="flex items-center gap-2">
+              {!queueStatus.started && (
+                <button
+                  onClick={startDay}
+                  className="bg-amber-500 text-white font-bold text-sm px-4 py-2.5 rounded-xl hover:bg-amber-600 transition-all shadow-md"
+                  title="Start doctor"
+                >
+                  ⭐ Start
+                </button>
+              )}
+              <button
+                onClick={callNext}
+                disabled={!queueStatus.started}
+                className="bg-sky-600 text-white font-bold text-sm px-5 py-2.5 rounded-xl hover:bg-sky-700 disabled:opacity-60 transition-all shadow-md"
+              >
+                {/* Burmese: + နောက်လူနာ ခေါ်မည် */}
+                {t.callNext}
+              </button>
+            </div>
           </div>
 
           {/* Queue Table (Presentational) */}
@@ -547,7 +732,7 @@ function DashboardContainer({ onLogout, lang, setLang, t }) {
 // ─────────────────────────────────────────────
 
 export default function App() {
-  const { isAuthenticated, loading, error, login, logout } = useAuth();
+  const { token, isAuthenticated, loading, error, login, logout } = useAuth();
   const [lang, setLang] = useState("en");
   const t = STRINGS[lang];
 
@@ -564,5 +749,5 @@ export default function App() {
     );
   }
 
-  return <DashboardContainer onLogout={logout} lang={lang} setLang={setLang} t={t} />;
+  return <DashboardContainer token={token} onLogout={logout} lang={lang} setLang={setLang} t={t} />;
 }
