@@ -422,24 +422,41 @@ function QueueTable({ queue, isLoading, onMarkCompleted, t }) {
   );
 }
 
-function WalkinForm({ onAdd, t }) {
+function WalkinForm({ onAdd, t, isTodaySelected }) {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [doctor, setDoctor] = useState(DOCTORS[0]);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
 
   const handleAdd = async () => {
     if (!name.trim() || !phone.trim()) return;
     setBusy(true);
-    await onAdd(name.trim(), phone.trim(), doctor);
-    setName("");
-    setPhone("");
-    setBusy(false);
+    setError(null);
+    try {
+      await onAdd(name.trim(), phone.trim(), doctor);
+      setName("");
+      setPhone("");
+    } catch (e) {
+      setError(e?.message || "Failed to add walk-in");
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
     <div className="bg-white rounded-2xl shadow-sm p-6 mt-4">
       <h2 className="text-xl font-bold text-gray-900 mb-4">{t.addWalkin}</h2>
+      {!isTodaySelected && (
+        <div className="mb-4 bg-amber-50 border border-amber-200 text-amber-800 rounded-xl px-4 py-3 text-sm">
+          Walk-in can only be added for today. Please select today’s date above.
+        </div>
+      )}
+      {error && (
+        <div className="mb-4 bg-red-50 border border-red-200 text-red-700 rounded-xl px-4 py-3 text-sm">
+          {error}
+        </div>
+      )}
       <div className="space-y-4">
         <div>
           <label className="block text-base text-gray-600 mb-1">{t.patientName}</label>
@@ -478,7 +495,7 @@ function WalkinForm({ onAdd, t }) {
         <div className="flex justify-end">
           <button
             onClick={handleAdd}
-            disabled={busy || !name.trim() || !phone.trim()}
+            disabled={busy || !isTodaySelected || !name.trim() || !phone.trim()}
             className="bg-sky-600 text-white font-bold text-sm px-6 py-2.5 rounded-xl hover:bg-sky-700 disabled:opacity-50 transition-all"
           >
             {busy ? "…" : t.addToQueue}
@@ -600,6 +617,7 @@ function DashboardContainer({ token, onLogout, lang, setLang, t }) {
   const { queue, isLoading, isFetching, error, queueStatus, startDay, callNext, markCompleted, addWalkin } =
     useQueueData(token, selectedDate, onLogout);
   const [activeNav, setActiveNav] = useState("queue");
+  const isTodaySelected = selectedDate === getLocalDateKey();
 
   return (
     <div className="min-h-screen bg-sky-50 flex flex-col">
@@ -700,7 +718,7 @@ function DashboardContainer({ token, onLogout, lang, setLang, t }) {
           />
 
           {/* Walk-in form */}
-          <WalkinForm onAdd={addWalkin} t={t} />
+          <WalkinForm onAdd={addWalkin} t={t} isTodaySelected={isTodaySelected} />
         </main>
       </div>
 
